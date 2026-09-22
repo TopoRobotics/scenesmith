@@ -598,6 +598,20 @@ def create_image_generator(backend: str, config: DictConfig) -> BaseImageGenerat
             aspect_ratio=config.gemini.aspect_ratio,
             image_size=config.gemini.image_size,
         )
+    elif backend == "bedrock":
+        # On-demand Amazon Bedrock (pay-per-image). Imported lazily so boto3 is
+        # only required when this backend is actually selected.
+        from scenesmith.agent_utils.bedrock_image_generation import (
+            BedrockImageGenerator,
+        )
+
+        bedrock_cfg = getattr(config, "bedrock", None)
+        kwargs = {}
+        if bedrock_cfg is not None:
+            for key in ("model_id", "region", "strength"):
+                if key in bedrock_cfg:
+                    kwargs[key] = bedrock_cfg[key]
+        return BedrockImageGenerator(**kwargs)
     else:
         raise ValueError(f"Unknown image generation backend: {backend}")
 
