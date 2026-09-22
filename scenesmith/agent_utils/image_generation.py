@@ -608,7 +608,7 @@ def create_image_generator(backend: str, config: DictConfig) -> BaseImageGenerat
         bedrock_cfg = getattr(config, "bedrock", None)
         kwargs = {}
         if bedrock_cfg is not None:
-            for key in ("model_id", "region", "quality", "cfg_scale", "similarity_strength"):
+            for key in ("model_id", "region", "strength"):
                 if key in bedrock_cfg:
                     kwargs[key] = bedrock_cfg[key]
         return BedrockImageGenerator(**kwargs)

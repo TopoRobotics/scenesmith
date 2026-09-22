@@ -2,16 +2,20 @@
 
 A drop-in ``BaseImageGenerator`` that routes the same three calls the OpenAI and
 Gemini backends serve to Bedrock's on-demand ``InvokeModel`` API — no provisioned
-throughput, nothing running when idle, billed per image. Amazon Nova Canvas by
-default (Titan Image works with the same request shape via ``model_id``):
+throughput, nothing running when idle, billed per image. Uses Stability's
+**SD3.5 Large** by default, which serves both of SceneSmith's needs with one
+model: text→image for asset images, and image-to-image for the two
+context-image edits.
 
-- ``generate_images``            -> Nova Canvas TEXT_IMAGE
-- ``generate_furniture_context`` -> Nova Canvas IMAGE_VARIATION (edit a render)
-- ``generate_manipuland_context``-> Nova Canvas IMAGE_VARIATION (edit a render)
+    generate_images                 -> mode "text-to-image"
+    generate_furniture_context      -> mode "image-to-image" (edit a render)
+    generate_manipuland_context     -> mode "image-to-image" (edit a render)
 
 Auth is standard AWS (the task's IAM role needs ``bedrock:InvokeModel`` for the
-model); region comes from config or ``AWS_REGION``. Kept in its own module so the
-core ``image_generation.py`` stays free of the boto3 import.
+model); the image region defaults to us-west-2 (where the Stability base
+generators are offered) and is independent of where the GPU/data live. Kept in
+its own module so the core ``image_generation.py`` stays free of the boto3
+import.
 """
 
 import base64
@@ -30,42 +34,39 @@ from scenesmith.prompts.registry import ImageGenerationPrompts
 
 console_logger = logging.getLogger(__name__)
 
-# Nova Canvas caps the prompt at 1024 characters; SceneSmith's composed prompts
-# can exceed that, so truncate defensively rather than let the API 400.
-_MAX_PROMPT_CHARS = 1024
 
-
-def _parse_size(size: str | None) -> tuple[int, int]:
-    """"1024x1024" -> (1024, 1024); default square. Nova Canvas takes ints."""
+def _aspect(size: str | None) -> str:
+    """Map an OpenAI-style size to a Stability aspect ratio (its size knob)."""
     if not size:
-        return 1024, 1024
+        return "1:1"
     try:
-        w, h = size.lower().split("x")
-        return int(w), int(h)
+        w, h = (int(x) for x in size.lower().split("x"))
     except (ValueError, AttributeError):
-        return 1024, 1024
+        return "1:1"
+    if w > h * 1.3:
+        return "16:9"
+    if h > w * 1.3:
+        return "9:16"
+    return "1:1"
 
 
 class BedrockImageGenerator(BaseImageGenerator):
-    """Image generation via Amazon Bedrock on-demand InvokeModel."""
+    """Image generation via Amazon Bedrock on-demand InvokeModel (Stability)."""
 
     def __init__(
         self,
-        model_id: str = "amazon.nova-canvas-v1:0",
+        model_id: str = "stability.sd3-5-large-v1:0",
         region: str | None = None,
-        quality: str = "standard",  # Nova Canvas: "standard" | "premium"
-        cfg_scale: float = 6.5,
-        similarity_strength: float = 0.7,  # IMAGE_VARIATION: how close to the reference
+        strength: float = 0.5,  # image-to-image: how far the edit moves from the reference
         client=None,
     ) -> None:
         import boto3  # local import: only this backend needs it
 
         self.model_id = model_id
-        self.quality = quality
-        self.cfg_scale = cfg_scale
-        self.similarity_strength = similarity_strength
+        self.strength = strength
         self.client = client or boto3.client(
-            "bedrock-runtime", region_name=region or os.environ.get("AWS_REGION", "us-east-1")
+            "bedrock-runtime",
+            region_name=region or os.environ.get("AWS_BEDROCK_REGION", "us-west-2"),
         )
         self.prompt_manager = PromptManager(prompts_dir=PROMPTS_DATA_DIR)
 
@@ -75,19 +76,17 @@ class BedrockImageGenerator(BaseImageGenerator):
         start = time.time()
         resp = self.client.invoke_model(modelId=self.model_id, body=json.dumps(body))
         payload = json.loads(resp["body"].read())
-        if payload.get("error"):
-            raise RuntimeError(f"Bedrock image generation error for {label}: {payload['error']}")
         images = payload.get("images") or []
         if not images:
-            raise RuntimeError(f"Bedrock returned no image for {label}")
+            raise RuntimeError(f"Bedrock returned no image for {label}: {payload.get('finish_reasons')}")
+        # Stability reports content filtering per image; a non-null reason means no usable image.
+        reasons = payload.get("finish_reasons") or [None]
+        if reasons[0]:
+            raise RuntimeError(f"Bedrock image for {label} was not produced: {reasons[0]}")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(base64.b64decode(images[0]))
         console_logger.info(f"Generated image for {label} in {time.time() - start:.2f}s (Bedrock {self.model_id})")
         return output_path
-
-    def _image_config(self, width: int, height: int) -> dict:
-        return {"numberOfImages": 1, "width": width, "height": height,
-                "quality": self.quality, "cfgScale": self.cfg_scale}
 
     # -- text -> image -----------------------------------------------------------
 
@@ -101,7 +100,7 @@ class BedrockImageGenerator(BaseImageGenerator):
     ) -> None:
         if len(object_descriptions) != len(output_paths):
             raise ValueError("Number of descriptions must match number of output paths")
-        width, height = _parse_size(size)
+        aspect = _aspect(size)
         effective_labels = labels if labels else object_descriptions
         console_logger.info(f"Generating {len(object_descriptions)} images (Bedrock {self.model_id})")
 
@@ -110,9 +109,7 @@ class BedrockImageGenerator(BaseImageGenerator):
                 ImageGenerationPrompts.ASSET_IMAGE_INITIAL,
                 description=description, style_prompt=style_prompt,
             )
-            body = {"taskType": "TEXT_IMAGE",
-                    "textToImageParams": {"text": prompt[:_MAX_PROMPT_CHARS]},
-                    "imageGenerationConfig": self._image_config(width, height)}
+            body = {"prompt": prompt, "mode": "text-to-image", "aspect_ratio": aspect, "output_format": "png"}
             self._invoke(body, output_path, label)
 
         with ThreadPoolExecutor() as executor:
@@ -125,12 +122,9 @@ class BedrockImageGenerator(BaseImageGenerator):
 
     def _edit_image(self, prompt: str, reference_image_path: Path, output_path: Path,
                     size: str = "1024x1024") -> Path:
-        width, height = _parse_size(size)
         ref_b64 = base64.b64encode(Path(reference_image_path).read_bytes()).decode("utf-8")
-        body = {"taskType": "IMAGE_VARIATION",
-                "imageVariationParams": {"images": [ref_b64], "text": prompt[:_MAX_PROMPT_CHARS],
-                                         "similarityStrength": self.similarity_strength},
-                "imageGenerationConfig": self._image_config(width, height)}
+        body = {"prompt": prompt, "mode": "image-to-image", "image": ref_b64,
+                "strength": self.strength, "output_format": "png"}
         console_logger.info(f"Editing image {reference_image_path} (Bedrock {self.model_id})")
         return self._invoke(body, output_path, "edited image")
 
